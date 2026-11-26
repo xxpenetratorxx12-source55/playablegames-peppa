@@ -441,12 +441,14 @@ fn va_to_rva(va: u64, image_base: u64) -> Result<u32, PeError> {
 mod tests {
     use super::*;
 
-    /// The test binary itself is a real MSVC-linked PE32+ image.
+    /// The test binary itself is a real MSVC-linked PE32+ image (on Windows;
+    /// elsewhere the tests that read it are ignored).
     fn own_image() -> Vec<u8> {
         std::fs::read(std::env::current_exe().unwrap()).unwrap()
     }
 
     #[test]
+    #[cfg_attr(not(windows), ignore = "reads the test binary, a PE image only on Windows")]
     fn parses_own_test_binary() {
         let info = ImageInfo::parse(&own_image()).unwrap();
         assert_eq!(info.machine, MACHINE_AMD64);
@@ -466,6 +468,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(windows), ignore = "reads the test binary, a PE image only on Windows")]
     fn rva_to_file_offset_maps_entry_point() {
         let data = own_image();
         let info = ImageInfo::parse(&data).unwrap();
@@ -474,6 +477,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(windows), ignore = "reads the test binary, a PE image only on Windows")]
     fn rva_to_file_offset_rejects_offsets_past_4_gib() {
         let mut info = ImageInfo::parse(&own_image()).unwrap();
         let rva = info.sections[0].rva + 0x20;
@@ -494,6 +498,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(windows), ignore = "reads the test binary, a PE image only on Windows")]
     fn rejects_iat_outside_image() {
         let mut data = own_image();
         let dd = layout::data_directory_offset(&data, dir::IMPORT).unwrap();
