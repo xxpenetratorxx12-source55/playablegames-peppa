@@ -50,6 +50,11 @@ the 7900 XTX. On top:
 5. Try `VICTORY_LIST_POOL_IDLE_S=10`: idle host lists that waited 10 s are let go, and
    their command allocators with them (9 GB of the 7900 XTX's private memory). The log
    says how much private memory each sweep freed; watch the frame time beside it.
+6. Try `VICTORY_STAGING_SETTLE_S=5`: staging buffers of textures uploaded and unchanged
+   for 5 s are let go while the textures are still sampled, and a write-watch look
+   stands in for them. The census's `settled textures` line says how much went and how
+   often a look found a texture written; compare the census's texture staging and the
+   frame time with it off.
 
 ## What is known of AMD from the trees this carries
 

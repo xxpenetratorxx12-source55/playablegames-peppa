@@ -348,6 +348,15 @@ fn take() -> Vec<String> {
         textures.iter().filter(|r| r.tiled).count(),
     ));
 
+    let [settled, ever, freed, unwritten, woke] = crate::texture::settle_census();
+    if ever > 0 {
+        lines.push(format!(
+            "settled textures (VICTORY_STAGING_SETTLE_S): {settled} now; since the start {ever} settled, {} of staging let go; \
+             looks that found them unwritten {unwritten}, written or unwatched (staged anew) {woke}",
+            mb(freed)
+        ));
+    }
+
     // What one copy would do without, by kind.
     let ours_all: u64 = c.iter().chain(&t).map(|s| s.ours).sum();
     let title_all: u64 = c.iter().chain(&t).map(|s| s.title).sum();
