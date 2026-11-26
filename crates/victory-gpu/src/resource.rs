@@ -2255,6 +2255,65 @@ pub(crate) fn census() -> [u64; 10] {
     count
 }
 
+/// One title texture, for the placement census (`crate::census`).
+#[cfg(all(windows, feature = "diagnostics"))]
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct TextureRow {
+    /// The key its staging buffer is kept by (`crate::texture`).
+    pub(crate) at: usize,
+    /// The bytes of title memory it is.
+    pub(crate) title_bytes: u64,
+    /// Whether it has a host copy, and the card's bytes for it (twin
+    /// included; 0 for one whose levels get tiles of their own: `tiled`).
+    pub(crate) host: bool,
+    pub(crate) card_bytes: u64,
+    pub(crate) tiled: bool,
+    /// Whether the title fills it (else the host renders to or writes it),
+    /// and whether the host copied into one the title fills.
+    pub(crate) filled: bool,
+    pub(crate) host_wrote: bool,
+    pub(crate) placed: bool,
+}
+
+/// Every title texture alive, for the placement census. Holds the table's
+/// lock for the walk, as [`census`] does.
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) fn texture_rows() -> Vec<TextureRow> {
+    use std::sync::atomic::Ordering::Relaxed;
+    let all = textures();
+    all.iter()
+        .map(|&at| {
+            // SAFETY: as in `let_go_idle`.
+            let r = unsafe { &*(at as *const Resource) };
+            let made = r.host.made.lock().unwrap_or_else(|e| e.into_inner());
+            let title_bytes = footprint(&r.desc).map_or(0, |f| f.size);
+            let placed = r.host.placed.load(Relaxed);
+            match made.as_ref() {
+                Some((host, twin)) => TextureRow {
+                    at,
+                    title_bytes,
+                    host: true,
+                    card_bytes: host.bytes + twin.as_ref().map_or(0, |t| t.colour.bytes),
+                    tiled: host.tiled.is_some(),
+                    filled: host.filled,
+                    host_wrote: host.filled && crate::texture::host_wrote(at),
+                    placed,
+                },
+                None => TextureRow {
+                    at,
+                    title_bytes,
+                    host: false,
+                    card_bytes: 0,
+                    tiled: false,
+                    filled: false,
+                    host_wrote: false,
+                    placed,
+                },
+            }
+        })
+        .collect()
+}
+
 /// Host textures alive (the title's and the twins) and the bytes the host
 /// gives them, for the memory line.
 #[cfg(windows)]

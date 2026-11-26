@@ -96,6 +96,10 @@ pub(crate) struct Staging {
     /// (`title_memory_reading`) instead of taking `no_wait()` /
     /// `refresh_unlocked()` or the 30-frame partial-read throttle.
     exact: std::sync::atomic::AtomicBool,
+    /// For the placement census (`crate::census`): how often title memory
+    /// was detiled into it (the first fill, then each change found).
+    #[cfg(feature = "diagnostics")]
+    detiles: std::sync::atomic::AtomicU64,
 }
 
 /// What a texture's staging buffer holds: the hash of the memory detiled
@@ -495,6 +499,20 @@ pub(crate) fn memory() -> [u64; 3] {
         .as_ref()
         .map_or(0, |map| map.len() as u64);
     [STAGED[0].load(Relaxed), STAGED[1].load(Relaxed), kept]
+}
+
+/// For the placement census (`crate::census`): each title texture's
+/// staging buffer still kept by its texture, as its bytes and how often
+/// title memory was detiled into it. One lock for all of them.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn staging_census() -> HashMap<usize, (u64, u64)> {
+    use std::sync::atomic::Ordering::Relaxed;
+    STAGING
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .map(|map| map.iter().map(|(&at, s)| (at, (s.bytes, s.detiles.load(Relaxed)))).collect())
+        .unwrap_or_default()
 }
 
 /// Staging buffers let go as idle since the start, and their bytes.
@@ -1490,6 +1508,8 @@ impl Staging {
     /// Detiles `tiled` (the texture's memory) into the staging buffer.
     fn detile(&self, tiled: &[u8]) {
         self.dirty.store(true, std::sync::atomic::Ordering::Relaxed);
+        #[cfg(feature = "diagnostics")]
+        self.detiles.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         // Levels on demand: which levels are the title's is judged here,
         // once, for what the staging buffer holds from now on. The step
         // that gives levels their memory goes by this answer.
@@ -1939,6 +1959,8 @@ fn staging(resource: This, copy: &crate::resource::HostTexture, first: u32) -> O
         judged: [const { std::sync::atomic::AtomicU64::new(0) }; 2],
         waiting: std::sync::atomic::AtomicU64::new(0),
         exact: std::sync::atomic::AtomicBool::new(BAKING.get()),
+        #[cfg(feature = "diagnostics")]
+        detiles: std::sync::atomic::AtomicU64::new(0),
     });
     map.insert(resource as usize, s.clone());
     Some(s)

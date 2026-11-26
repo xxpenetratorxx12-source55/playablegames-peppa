@@ -102,6 +102,11 @@ pub(crate) struct Shadow {
     /// and the bytes from the buffer's first byte to `start` (the heap
     /// begins on a 64 KiB line; a title buffer need not).
     place: Option<(windows::Win32::Graphics::Direct3D12::ID3D12Heap, u64)>,
+    /// For the placement census (`crate::census`): the refreshes that
+    /// copied title bytes in, those bytes, and the bytes shaders wrote that
+    /// went back to title memory, since the copy was made.
+    #[cfg(feature = "diagnostics")]
+    moved: [AtomicU64; 3],
 }
 
 /// What a copy in the card's memory ([`cards`]) has beside the buffer
@@ -2874,6 +2879,78 @@ pub(crate) fn memory() -> [u64; 6] {
     ]
 }
 
+/// Where a host copy of title memory lies, for the placement census
+/// (`crate::census`).
+#[cfg(feature = "diagnostics")]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Lies {
+    /// No copy: a buffer placed over title memory (`crate::inplace`).
+    InPlace,
+    /// A buffer in the PC's memory the card reads over the bus.
+    PcMemory,
+    /// In the card's memory, with a CPU side in the PC's memory.
+    CardWithCpuSide,
+    /// In the card's memory, mapped by the CPU (`GPU_UPLOAD`).
+    CardMapped,
+}
+
+/// One host copy of title memory, for the placement census.
+#[cfg(feature = "diagnostics")]
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct CopyRow {
+    pub(crate) len: u64,
+    pub(crate) window: bool,
+    pub(crate) lies: Lies,
+    /// The bytes of the CPU side (`Lies::CardWithCpuSide`).
+    pub(crate) cpu_side: u64,
+    /// Refreshes that copied title bytes in, and their bytes.
+    pub(crate) fills: u64,
+    pub(crate) bytes_in: u64,
+    /// Whether shaders were ever declared to write it, and the bytes that
+    /// went back to title memory.
+    pub(crate) shader_written: bool,
+    pub(crate) bytes_back: u64,
+}
+
+/// Every host copy of title memory alive (each once: a window may stand
+/// under several keys), for the placement census.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn census_rows() -> Vec<CopyRow> {
+    // Read under the maps' locks, holding no copy: the last hold of one let
+    // go here would free it on this thread, past `crate::host::retire`.
+    fn row(s: &Shadow) -> CopyRow {
+        let lies = if s.place.is_some() {
+            Lies::InPlace
+        } else if s.mapped {
+            Lies::CardMapped
+        } else if s.card.is_some() {
+            Lies::CardWithCpuSide
+        } else {
+            Lies::PcMemory
+        };
+        CopyRow {
+            len: s.len,
+            window: s.window,
+            lies,
+            cpu_side: s.card.as_ref().map_or(0, |c| c.size),
+            fills: s.moved[0].load(Ordering::Relaxed),
+            bytes_in: s.moved[1].load(Ordering::Relaxed),
+            shader_written: s.written.load(Ordering::Relaxed),
+            bytes_back: s.moved[2].load(Ordering::Relaxed),
+        }
+    }
+    let mut seen = std::collections::HashSet::new();
+    let mut rows: Vec<CopyRow> = buffers_read()
+        .values()
+        .filter_map(|e| e.shadow.as_deref())
+        .filter(|s| seen.insert(std::ptr::from_ref(*s) as usize))
+        .map(row)
+        .collect();
+    let loose = LOOSE.write().unwrap_or_else(|e| e.into_inner());
+    rows.extend(loose.values().filter(|s| seen.insert(Arc::as_ptr(s) as usize)).map(|s| row(s)));
+    rows
+}
+
 // SAFETY: D3D12 resources are free-threaded; `data` is a persistent mapping
 // written only on the submitting thread.
 unsafe impl Send for Shadow {}
@@ -2994,6 +3071,8 @@ impl Shadow {
             changes_only: Default::default(),
             mapped: false,
             place: None,
+            #[cfg(feature = "diagnostics")]
+            moved: Default::default(),
         }
     }
 
@@ -3154,6 +3233,13 @@ impl Shadow {
     /// [`Shadow::copy_back`]; `found`, if given, is the pieces of the range
     /// that differ from the snapshot, found beforehand ([`find_all`]).
     pub(crate) fn copy_back_with(&self, address: usize, len: usize, found: Option<Vec<(usize, usize)>>) -> usize {
+        let bytes = self.copy_back_inner(address, len, found);
+        #[cfg(feature = "diagnostics")]
+        self.moved[2].fetch_add(bytes as u64, Ordering::Relaxed);
+        bytes
+    }
+
+    fn copy_back_inner(&self, address: usize, len: usize, found: Option<Vec<(usize, usize)>>) -> usize {
         if self.place.is_some() {
             return 0;
         }
@@ -3679,6 +3765,16 @@ impl Shadow {
     /// since it was last copied (all of it if the memory is not
     /// write-watched). Returns the bytes copied.
     pub(crate) fn update(&self, address: usize, len: usize) -> usize {
+        let bytes = self.update_inner(address, len);
+        #[cfg(feature = "diagnostics")]
+        if bytes > 0 {
+            self.moved[0].fetch_add(1, Ordering::Relaxed);
+            self.moved[1].fetch_add(bytes as u64, Ordering::Relaxed);
+        }
+        bytes
+    }
+
+    fn update_inner(&self, address: usize, len: usize) -> usize {
         // In place: the card reads title memory itself.
         if self.place.is_some() {
             return 0;
