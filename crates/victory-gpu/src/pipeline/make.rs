@@ -501,6 +501,11 @@ fn workers() -> bool {
             let screens_only = i >= workers;
             let spawned = std::thread::Builder::new()
                 .name(format!("victory-pipelines-{i}"))
+                // The driver compiles pipelines on this thread, recursively:
+                // NVIDIA's compiler overflowed the default 2 MB on a world
+                // compute program and refused it as out of memory (reserved
+                // address space; committed only as used).
+                .stack_size(64 << 20)
                 .spawn(move || {
                     // Below the title's own threads (loading, recording),
                     // and the streaming one, which is below normal itself
