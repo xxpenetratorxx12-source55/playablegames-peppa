@@ -424,6 +424,10 @@ pub(crate) fn references(object: &impl Interface) -> u32 {
 fn sweep() {
     // The in-place probe and census, if asked for (`VICTORY_INPLACE_PROBE`).
     crate::inplace::tick();
+    // Who touches the title memory the card uses, and where its copies lie
+    // (`VICTORY_CENSUS`).
+    #[cfg(feature = "diagnostics")]
+    crate::census::tick();
     static ON: OnceLock<bool> = OnceLock::new();
     if !*ON.get_or_init(|| std::env::var_os("VICTORY_SWEEP").is_none_or(|v| v != "0")) {
         return;
@@ -449,6 +453,7 @@ fn sweep() {
     crate::shadow::let_go_idle();
     crate::texture::let_go_idle();
     crate::resource::let_go_idle();
+    crate::list::trim_idle();
 }
 
 /// The number of the newest submission begun, and of the newest of which all
@@ -2656,6 +2661,9 @@ struct Flight {
 }
 
 /// One thing in the line of what waits for the card, in order.
+// Most entries are flights: boxing them would add an allocation a flight and
+// save nothing.
+#[allow(clippy::large_enum_variant)]
 enum Late {
     Run(Flight),
     /// A bottom-of-pipe write of the flight before it: address, what, bytes.
@@ -2882,7 +2890,7 @@ fn blame_stale(stale: &[(std::sync::Arc<crate::shadow::Shadow>, usize, usize)]) 
 /// title memory read, took `us`.
 #[cfg(feature = "diagnostics")]
 fn blamed(why: usize, us: u64) {
-    let (named, refused) = std::mem::replace(&mut *BLAMED.lock().unwrap_or_else(|e| e.into_inner()), (None, ""));
+    let (named, refused) = std::mem::take(&mut *BLAMED.lock().unwrap_or_else(|e| e.into_inner()));
     let (key, at) = match (why, named) {
         (WHY_READ | WHY_STALE, Some(named)) => named,
         (WHY_READ, None) => (("a host copy of what a copy done on the card wrote", refused, 0, 0, 0), 0),
@@ -3681,6 +3689,8 @@ fn late_line(frames: f64) {
 pub(crate) mod aside;
 pub(crate) mod awake;
 mod card_steps;
+// What is in it serves diagnostics; its tests run in every build.
+#[cfg_attr(not(feature = "diagnostics"), allow(dead_code))]
 pub(crate) mod indirects;
 #[cfg(feature = "diagnostics")]
 mod panel;
@@ -7752,7 +7762,9 @@ enum Touch {
     Refresh(usize, usize, usize),
     /// The copy is given to shaders.
     Write(usize),
-    /// Title memory is written.
+    /// Title memory is written. ([`HostList`]'s refresh ahead stops at such a
+    /// step itself; the tests write it out.)
+    #[cfg_attr(not(test), expect(dead_code, reason = "made only by the tests"))]
     Title,
     Nothing,
     /// Another part of the submission begins.

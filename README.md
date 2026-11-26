@@ -62,7 +62,9 @@ $env:VICTORY_GAME_DIR = 'D:\Games\MyDump'    # your own dump, outside this folde
 ```
 
 The launcher picks the Series S profile and settings tested on RTX cards, and
-keeps its shader cache under `%LOCALAPPDATA%\VIctory\cache-pareto`. If the
+keeps its shader cache under `%LOCALAPPDATA%\VIctory\cache-pareto`. On an AMD RDNA 2
+card (RX 6800 XT and its kin) run `.\Play-VIctory.cmd rdna2`: what it changes, and what
+to look at on the first runs, is in [docs/rdna2.md](docs/rdna2.md). If the
 title's own watchdog ends a run (it can while frames are slow),
 set `VICTORY_NO_WATCHDOG=1` first.
 
