@@ -1,7 +1,12 @@
 @echo off
 setlocal EnableExtensions DisableDelayedExpansion
-if not "%~1"=="" if /i not "%~1"=="pareto-residency" (
-  echo Usage: Play-VIctory.cmd pareto-residency 1>&2
+rem pareto-residency (the default): the settings tested on RTX cards.
+rem rdna2: the same for an AMD RDNA 2 card (RX 6800 XT and its kin), plus windows
+rem of title memory in card memory the CPU maps when Smart Access Memory is on.
+set "profile=%~1"
+if "%profile%"=="" set "profile=pareto-residency"
+if /i not "%profile%"=="pareto-residency" if /i not "%profile%"=="rdna2" (
+  echo Usage: Play-VIctory.cmd [pareto-residency^|rdna2] 1>&2
   exit /b 2
 )
 if not defined VICTORY_GAME_DIR set "VICTORY_GAME_DIR=%~dp0..\game-dump"
@@ -10,12 +15,21 @@ if not exist "%VICTORY_GAME_DIR%\game_scarlett_master.exe" (
   exit /b 2
 )
 set "runner=%~dp0victory-3d-rtx-pareto-residency.exe"
+if /i "%profile%"=="rdna2" set "runner=%~dp0target\release\victory.exe"
 if not exist "%runner%" set "runner=%~dp0target\release\victory.exe"
 if not exist "%runner%" (
   echo Extract the Windows release or run cargo build --release --locked -p victory. 1>&2
   exit /b 2
 )
 if not defined VICTORY_AMBIENT_AIR set "VICTORY_AMBIENT_AIR=1.5"
+rem rdna2: a shader cache of its own, as what the translator makes for RDNA differs;
+rem and windows in card memory the CPU maps, GPU_UPLOAD heaps, which need Smart Access
+rem Memory on and do nothing without it. The replayed yard frame on an RX 7900 XTX:
+rem 36.3 ms, 31.9 with them.
+if /i "%profile%"=="rdna2" (
+  if not defined VICTORY_CACHE_DIR set "VICTORY_CACHE_DIR=%LOCALAPPDATA%\VIctory\cache-rdna2"
+  if not defined VICTORY_WINDOWS_BAR_MB set "VICTORY_WINDOWS_BAR_MB=1024"
+)
 if not defined VICTORY_CACHE_DIR set "VICTORY_CACHE_DIR=%LOCALAPPDATA%\VIctory\cache-pareto"
 if not defined VICTORY_TEXTURE_NO_WAIT set "VICTORY_TEXTURE_NO_WAIT=1"
 if not defined VICTORY_RELAY set "VICTORY_RELAY=2"

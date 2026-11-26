@@ -101,7 +101,7 @@ pub(crate) struct ResourceDesc {
 #[cfg(windows)]
 impl ResourceDesc {
     /// The texture of this one's levels from `base` on.
-    fn from_level(&self, base: u32) -> ResourceDesc {
+    fn levels_from(&self, base: u32) -> ResourceDesc {
         let mut d = *self;
         if base > 0 {
             d.width = (d.width >> base).max(1);
@@ -1587,7 +1587,7 @@ fn hosted(this: This, make: bool) -> Option<Made> {
         }
         let texture = match texture {
             Some(texture) => Some(texture),
-            None => host_texture(&r.desc.from_level(base), r.host.state, clear),
+            None => host_texture(&r.desc.levels_from(base), r.host.state, clear),
         };
         let Some(texture) = texture else {
             r.host.refused.store(true, Relaxed);
@@ -2255,6 +2255,65 @@ pub(crate) fn census() -> [u64; 10] {
     count
 }
 
+/// One title texture, for the placement census (`crate::census`).
+#[cfg(all(windows, feature = "diagnostics"))]
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct TextureRow {
+    /// The key its staging buffer is kept by (`crate::texture`).
+    pub(crate) at: usize,
+    /// The bytes of title memory it is.
+    pub(crate) title_bytes: u64,
+    /// Whether it has a host copy, and the card's bytes for it (twin
+    /// included; 0 for one whose levels get tiles of their own: `tiled`).
+    pub(crate) host: bool,
+    pub(crate) card_bytes: u64,
+    pub(crate) tiled: bool,
+    /// Whether the title fills it (else the host renders to or writes it),
+    /// and whether the host copied into one the title fills.
+    pub(crate) filled: bool,
+    pub(crate) host_wrote: bool,
+    pub(crate) placed: bool,
+}
+
+/// Every title texture alive, for the placement census. Holds the table's
+/// lock for the walk, as [`census`] does.
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) fn texture_rows() -> Vec<TextureRow> {
+    use std::sync::atomic::Ordering::Relaxed;
+    let all = textures();
+    all.iter()
+        .map(|&at| {
+            // SAFETY: as in `let_go_idle`.
+            let r = unsafe { &*(at as *const Resource) };
+            let made = r.host.made.lock().unwrap_or_else(|e| e.into_inner());
+            let title_bytes = footprint(&r.desc).map_or(0, |f| f.size);
+            let placed = r.host.placed.load(Relaxed);
+            match made.as_ref() {
+                Some((host, twin)) => TextureRow {
+                    at,
+                    title_bytes,
+                    host: true,
+                    card_bytes: host.bytes + twin.as_ref().map_or(0, |t| t.colour.bytes),
+                    tiled: host.tiled.is_some(),
+                    filled: host.filled,
+                    host_wrote: host.filled && crate::texture::host_wrote(at),
+                    placed,
+                },
+                None => TextureRow {
+                    at,
+                    title_bytes,
+                    host: false,
+                    card_bytes: 0,
+                    tiled: false,
+                    filled: false,
+                    host_wrote: false,
+                    placed,
+                },
+            }
+        })
+        .collect()
+}
+
 /// Host textures alive (the title's and the twins) and the bytes the host
 /// gives them, for the memory line.
 #[cfg(windows)]
@@ -2533,7 +2592,7 @@ fn host_texture_as(
         }
     };
     if let Err(e) = &made {
-        crate::residency::allocation_error(&e);
+        crate::residency::allocation_error(e);
         tracing::warn!(error = %e, desc = ?d, reserved, "no host texture");
     }
     if !reserved
@@ -2953,7 +3012,7 @@ static PLACED_RAW: std::sync::Mutex<std::collections::BTreeSet<(u64, [u32; 14])>
 static PLACED_TWINS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// See [`PLACED_TWINS`].
-#[cfg(windows)]
+#[cfg(all(windows, feature = "diagnostics"))]
 pub(crate) fn placed_filler_twins() -> u64 {
     PLACED_TWINS.load(std::sync::atomic::Ordering::Relaxed)
 }

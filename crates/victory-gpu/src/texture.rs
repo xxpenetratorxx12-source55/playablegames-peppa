@@ -96,6 +96,16 @@ pub(crate) struct Staging {
     /// (`title_memory_reading`) instead of taking `no_wait()` /
     /// `refresh_unlocked()` or the 30-frame partial-read throttle.
     exact: std::sync::atomic::AtomicBool,
+    /// For the placement census (`crate::census`): how often title memory
+    /// was detiled into it (the first fill, then each change found).
+    #[cfg(feature = "diagnostics")]
+    detiles: std::sync::atomic::AtomicU64,
+    /// Whether its last check asked the write-watch ([`Staging::refresh`]'s
+    /// first way, which misses no write): only such a texture is settled
+    /// ([`settle_after_ms`]).
+    watched: std::sync::atomic::AtomicBool,
+    /// When title memory was last detiled into it (`crate::host::now_ms`).
+    detiled_at: std::sync::atomic::AtomicU64,
 }
 
 /// What a texture's staging buffer holds: the hash of the memory detiled
@@ -497,6 +507,149 @@ pub(crate) fn memory() -> [u64; 3] {
     [STAGED[0].load(Relaxed), STAGED[1].load(Relaxed), kept]
 }
 
+/// Seconds a title texture's staging buffer must stand uploaded and
+/// unchanged before it is let go while the texture is still sampled
+/// (`VICTORY_STAGING_SETTLE_S`; 0, the default: never).
+///
+/// A staging buffer is PC memory the size of its texture, kept so that the
+/// check at each submission can say the texture is unchanged without
+/// reading it. For memory the write-watch covers, that check needs only
+/// the asking the buffer was last detiled after, not the buffer: so a
+/// buffer uploaded, not dirty, held by no list, and not detiled again for
+/// this long gives way to a [`Settled`] record of that asking. The next
+/// list that samples the texture asks the write-watch: unwritten, it
+/// records no upload (the host copy holds those bytes); written, or no
+/// longer watched, the record goes and a staging buffer is made anew,
+/// detiled and uploaded, as for any texture. A change the title makes
+/// between that look and the list's submission is found by the next list
+/// that samples it, as one found at a submission is uploaded by the next.
+/// Guarded memory (views of physical pages) keeps its buffers: its guard
+/// can miss a write, and its check hashes every eighth frame.
+fn settle_after_ms() -> u64 {
+    static MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *MS.get_or_init(|| {
+        std::env::var("VICTORY_STAGING_SETTLE_S").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(0) * 1000
+    })
+}
+
+/// What a settled texture's staging buffer left behind ([`settle_after_ms`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Settled {
+    memory: usize,
+    read: usize,
+    /// The first level the buffer held, and the host copy it went into.
+    first: u32,
+    serial: u64,
+    /// The write-watch asking it was last checked after.
+    asked: u64,
+    /// The buffer's bytes, let go.
+    bytes: u64,
+}
+
+/// Settled textures by the same key as [`STAGING`]. Taken after
+/// [`STAGING`] where both are, never before it.
+static SETTLED: Mutex<Option<HashMap<usize, Settled>>> = Mutex::new(None);
+
+/// Settled since the start and the bytes let go, looks that found the
+/// texture unwritten, and looks that found it written (or unwatched).
+static SETTLE_STATS: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+
+fn with_settled<R>(f: impl FnOnce(&mut HashMap<usize, Settled>) -> R) -> R {
+    f(SETTLED.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(HashMap::new))
+}
+
+fn settled_record(at: usize) -> Option<Settled> {
+    if settle_after_ms() == 0 {
+        return None;
+    }
+    with_settled(|m| m.get(&at).copied())
+}
+
+fn unsettle(at: usize) {
+    if settle_after_ms() != 0 {
+        with_settled(|m| m.remove(&at));
+    }
+}
+
+impl Staging {
+    /// The record this staging buffer may give way to at `now`, if it may
+    /// ([`settle_after_ms`]): uploaded and not dirty, checked by the
+    /// write-watch, not detiled for `after` ms, and of none of the kinds
+    /// that are checked or uploaded another way.
+    fn settled(&self, now: u64, after: u64) -> Option<Settled> {
+        use std::sync::atomic::Ordering::Relaxed;
+        if !self.uploaded.load(Relaxed)
+            || self.dirty.load(Relaxed)
+            || !self.watched.load(Relaxed)
+            || self.on_demand
+            || self.once.load(Relaxed)
+            || self.exact.load(Relaxed)
+            || self.movie_plane()
+            || now.saturating_sub(self.detiled_at.load(Relaxed)) < after
+        {
+            return None;
+        }
+        // (Not waited for: a check that holds it is under way.)
+        let last = self.last.try_lock().ok()?;
+        if last.asked == 0 || last.partial.is_some() {
+            return None;
+        }
+        Some(Settled {
+            memory: self.memory as usize,
+            read: self.read,
+            first: self.first,
+            serial: self.serial,
+            asked: last.asked,
+            bytes: self.bytes,
+        })
+    }
+}
+
+/// Whether `resource` is settled for its host copy `copy` from level
+/// `first` on and its memory was not written since: then nothing is
+/// uploaded. Otherwise its record goes, and the caller stages it anew.
+fn settled_unchanged(resource: This, copy: &crate::resource::HostTexture, first: u32) -> bool {
+    use std::sync::atomic::Ordering::Relaxed;
+    let at = resource as usize;
+    let Some(record) = settled_record(at) else {
+        return false;
+    };
+    let same_copy = record.serial == copy.serial && record.first <= first.max(copy.base);
+    let unwritten = same_copy
+        && crate::watch::writes(record.memory, record.memory + record.read, false)
+            .is_some_and(|(_, written)| written.iter().all(|&(_, w)| w <= record.asked));
+    if unwritten {
+        SETTLE_STATS[2].fetch_add(1, Relaxed);
+        return true;
+    }
+    unsettle(at);
+    SETTLE_STATS[3].fetch_add(1, Relaxed);
+    false
+}
+
+/// For the placement census: settled textures now, and since the start:
+/// settled, bytes let go, looks that found them unwritten, and that did not.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn settle_census() -> [u64; 5] {
+    use std::sync::atomic::Ordering::Relaxed;
+    let now = if settle_after_ms() == 0 { 0 } else { with_settled(|m| m.len() as u64) };
+    [now, SETTLE_STATS[0].load(Relaxed), SETTLE_STATS[1].load(Relaxed), SETTLE_STATS[2].load(Relaxed), SETTLE_STATS[3].load(Relaxed)]
+}
+
+/// For the placement census (`crate::census`): each title texture's
+/// staging buffer still kept by its texture, as its bytes and how often
+/// title memory was detiled into it. One lock for all of them.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn staging_census() -> HashMap<usize, (u64, u64)> {
+    use std::sync::atomic::Ordering::Relaxed;
+    STAGING
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .map(|map| map.iter().map(|(&at, s)| (at, (s.bytes, s.detiles.load(Relaxed)))).collect())
+        .unwrap_or_default()
+}
+
 /// Staging buffers let go as idle since the start, and their bytes.
 static LET_GO: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
 
@@ -529,7 +682,18 @@ pub(crate) fn let_go_idle() {
     // is reset: one only the table holds is named by no list, recorded or
     // running.
     let (mut went, mut bytes) = (0u64, 0u64);
-    map.retain(|_, s| {
+    let settle = settle_after_ms();
+    let now = crate::host::now_ms();
+    map.retain(|&at, s| {
+        if settle != 0
+            && Arc::strong_count(s) == 1
+            && let Some(record) = s.settled(now, settle)
+        {
+            with_settled(|m| m.insert(at, record));
+            SETTLE_STATS[0].fetch_add(1, Relaxed);
+            SETTLE_STATS[1].fetch_add(s.bytes, Relaxed);
+            return false;
+        }
         let keep = Arc::strong_count(s) > 1
             || !crate::host::long_ago(s.used.load(Relaxed), idle_ms, IDLE_FRAMES);
         if !keep {
@@ -629,6 +793,8 @@ pub(crate) fn forget(resource: usize) {
     if let Some(map) = map.as_mut() {
         map.remove(&resource);
     }
+    drop(map);
+    unsettle(resource);
     let mut set = HOST_WRITTEN.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(set) = set.as_mut() {
         set.remove(&resource);
@@ -757,6 +923,11 @@ pub(crate) fn upload_from(list: &HostList, resource: This, first: u32) {
     };
     let texture = &copy.texture;
     ahead::listed(&copy);
+    // Settled, and title memory unwritten since: the host copy holds its
+    // bytes, and no staging buffer is needed to say so.
+    if settled_unchanged(resource, &copy, first) {
+        return;
+    }
     let Some(staging) = staging(resource, &copy, first) else {
         return;
     };
@@ -1271,6 +1442,7 @@ impl Staging {
             return 0;
         }
         if !alone && let Some((now, written)) = waited(1, || crate::watch::writes(start, start + size, false)) {
+            self.watched.store(true, std::sync::atomic::Ordering::Relaxed);
             if !exact && last.asked != 0 && written.iter().all(|&(_, w)| w <= last.asked) {
                 return 0;
             }
@@ -1490,6 +1662,9 @@ impl Staging {
     /// Detiles `tiled` (the texture's memory) into the staging buffer.
     fn detile(&self, tiled: &[u8]) {
         self.dirty.store(true, std::sync::atomic::Ordering::Relaxed);
+        #[cfg(feature = "diagnostics")]
+        self.detiles.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.detiled_at.store(crate::host::now_ms(), std::sync::atomic::Ordering::Relaxed);
         // Levels on demand: which levels are the title's is judged here,
         // once, for what the staging buffer holds from now on. The step
         // that gives levels their memory goes by this answer.
@@ -1549,12 +1724,17 @@ pub(crate) fn unstage(resource: This) {
     if let Some(map) = map.as_mut() {
         map.remove(&(resource as usize));
     }
+    drop(map);
+    unsettle(resource as usize);
 }
 
 /// Where a staged title texture's memory is: address and bytes.
 pub(crate) fn staged_memory(resource: This) -> Option<(u64, u64)> {
-    let map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
-    let (at, len) = map.as_ref()?.get(&(resource as usize))?.memory();
+    let staged = {
+        let map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
+        map.as_ref().and_then(|map| map.get(&(resource as usize)).map(|s| s.memory()))
+    };
+    let (at, len) = staged.or_else(|| settled_record(resource as usize).map(|r| (r.memory, r.read)))?;
     Some((at as u64, len as u64))
 }
 
@@ -1655,8 +1835,12 @@ pub(crate) fn title_span(resource: This, first: u32) -> Option<(u64, u64)> {
 }
 
 pub(crate) fn is_staged(resource: This) -> bool {
-    let map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
-    map.as_ref().is_some_and(|map| map.contains_key(&(resource as usize)))
+    let staged = {
+        let map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
+        map.as_ref().is_some_and(|map| map.contains_key(&(resource as usize)))
+    };
+    // A settled texture is one draws read through a table, as before.
+    staged || settled_record(resource as usize).is_some()
 }
 
 /// The bytes of a title texture's memory, and whether all of it is mapped,
@@ -1665,9 +1849,13 @@ pub(crate) fn is_staged(resource: This) -> bool {
 pub(crate) fn staged(resource: This, ask: bool) -> Option<(u64, bool)> {
     let s = {
         let map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
-        map.as_ref()?.get(&(resource as usize))?.clone()
+        map.as_ref().and_then(|map| map.get(&(resource as usize)).cloned())
     };
-    Some((s.read as u64, !ask || committed(s.memory, s.read)))
+    let (memory, read) = match s {
+        Some(s) => (s.memory, s.read),
+        None => settled_record(resource as usize).map(|r| (r.memory as *const u8, r.read))?,
+    };
+    Some((read as u64, !ask || committed(memory, read)))
 }
 
 /// Whether `[at, at + len)` is committed memory (streamed textures may be
@@ -1939,6 +2127,10 @@ fn staging(resource: This, copy: &crate::resource::HostTexture, first: u32) -> O
         judged: [const { std::sync::atomic::AtomicU64::new(0) }; 2],
         waiting: std::sync::atomic::AtomicU64::new(0),
         exact: std::sync::atomic::AtomicBool::new(BAKING.get()),
+        #[cfg(feature = "diagnostics")]
+        detiles: std::sync::atomic::AtomicU64::new(0),
+        watched: std::sync::atomic::AtomicBool::new(false),
+        detiled_at: std::sync::atomic::AtomicU64::new(crate::host::now_ms()),
     });
     map.insert(resource as usize, s.clone());
     Some(s)
@@ -2160,7 +2352,7 @@ mod allocation_costs {
                 seen.push(digest(&bytes));
             }
         }
-        let text: Vec<u8> = (0..400u32).map(|i| (i * 37 >> 2) as u8).collect();
+        let text: Vec<u8> = (0..400u32).map(|i| ((i * 37) >> 2) as u8).collect();
         for at in 0..399 {
             let mut bytes = text.clone();
             bytes.swap(at, at + 1);

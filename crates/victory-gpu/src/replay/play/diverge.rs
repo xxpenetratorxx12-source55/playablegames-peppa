@@ -1214,7 +1214,8 @@ impl Player {
                 word(if s.kind == slot::SRV { 4 } else { 2 }),
                 word(if s.kind == slot::SRV { 6 } else { 4 }),
                 word(if s.kind == slot::SRV { 7 } else { 5 }),
-                word(if s.kind == slot::SRV { 8 } else { 8 }),
+                // Flags: word 8 in both (an SRV's mapping and padding, a UAV's counter offset).
+                word(8),
             ),
         }
     }
