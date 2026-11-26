@@ -47,6 +47,9 @@ the 7900 XTX. On top:
    and say how much memory is a second or third copy, and of what.
 3. Look at what the four wave64 programs draw (README) now that they run.
 4. Compare `VICTORY_WINDOWS_BAR_MB=0` against the default, same build path, same place.
+5. Try `VICTORY_LIST_POOL_IDLE_S=10`: idle host lists that waited 10 s are let go, and
+   their command allocators with them (9 GB of the 7900 XTX's private memory). The log
+   says how much private memory each sweep freed; watch the frame time beside it.
 
 ## What is known of AMD from the trees this carries
 

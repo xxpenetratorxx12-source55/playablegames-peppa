@@ -211,10 +211,10 @@ impl Detached {
     }
 }
 
-/// A host list that has run and waits to be used again, and the bytes of
-/// upload memory it keeps.
+/// A host list that has run and waits to be used again, the bytes of
+/// upload memory it keeps, and when it was put back (`crate::host::now_ms`).
 #[cfg(windows)]
-struct Idle(crate::host::HostList, u64);
+struct Idle(crate::host::HostList, u64, u64);
 
 // SAFETY: D3D12 objects are free-threaded, and an idle list is touched by
 // nobody until it is taken out again.
@@ -255,13 +255,13 @@ fn fresh_list() -> Option<crate::host::HostList> {
     let idle = {
         let mut idle = IDLE.lock().unwrap_or_else(|e| e.into_inner());
         let taken = idle.0.pop();
-        if let Some(Idle(_, bytes)) = &taken {
+        if let Some(Idle(_, bytes, _)) = &taken {
             idle.1 -= bytes;
         }
         taken
     };
     match idle {
-        Some(Idle(list, _)) => Some(list),
+        Some(Idle(list, ..)) => Some(list),
         None => crate::host::host().and_then(|h| h.new_list().ok()),
     }
 }
@@ -288,10 +288,73 @@ pub(crate) fn recycle(lists: Vec<Detached>, ran: &[usize]) {
         let bytes = host.scratch_kept();
         let mut idle = IDLE.lock().unwrap_or_else(|e| e.into_inner());
         if idle.0.len() < IDLE_MOST.0 && idle.1 + bytes <= IDLE_MOST.1 {
-            idle.0.push(Idle(host, bytes));
+            idle.0.push(Idle(host, bytes, crate::host::now_ms()));
             idle.1 += bytes;
         }
     }
+}
+
+/// Seconds a host list may wait in the pool before it is let go
+/// (`VICTORY_LIST_POOL_IDLE_S`; 0, the default: never).
+///
+/// A command allocator keeps the memory its largest recording took over a
+/// reset, so every idle list holds its two allocators at their peak; and the
+/// pool is taken from its top, so the lists at its bottom wait longest and
+/// are seldom taken again. The RX 7900 XTX's runs had 9 GB of private
+/// memory in lists' allocators (docs/findings.md). Lists that waited this
+/// long go, oldest first, down to [`IDLE_FLOOR`]: what it costs is a list
+/// made anew when a busier stretch needs more again. In diagnostics builds
+/// each sweep that lets lists go says how much private memory fell.
+#[cfg(windows)]
+fn idle_most_ms() -> u64 {
+    static MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *MS.get_or_init(|| {
+        std::env::var("VICTORY_LIST_POOL_IDLE_S").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(0) * 1000
+    })
+}
+
+/// Idle host lists [`trim_idle`] always leaves.
+#[cfg(windows)]
+const IDLE_FLOOR: usize = 64;
+
+/// Of the idle host lists, those at the bottom of the pool that waited
+/// longer than [`idle_most_ms`] are let go ([`IDLE_FLOOR`] stay). Once a
+/// second, from the sweep; nothing is let go under the pool's lock.
+#[cfg(windows)]
+pub(crate) fn trim_idle() {
+    let most = idle_most_ms();
+    if most == 0 {
+        return;
+    }
+    let now = crate::host::now_ms();
+    let gone: Vec<Idle> = {
+        let mut idle = IDLE.lock().unwrap_or_else(|e| e.into_inner());
+        let spare = idle.0.len().saturating_sub(IDLE_FLOOR);
+        // Put back in order: the oldest lie first.
+        let old = idle.0.iter().take(spare).take_while(|i| now.saturating_sub(i.2) > most).count();
+        let gone: Vec<Idle> = idle.0.drain(..old).collect();
+        idle.1 -= gone.iter().map(|i| i.1).sum::<u64>();
+        gone
+    };
+    if gone.is_empty() {
+        return;
+    }
+    #[cfg(feature = "diagnostics")]
+    let before = crate::copystat::process_memory().1;
+    let count = gone.len();
+    drop(gone);
+    #[cfg(feature = "diagnostics")]
+    {
+        let after = crate::copystat::process_memory().1;
+        tracing::info!(
+            count,
+            private_fell_mb = before.saturating_sub(after) >> 20,
+            left = IDLE.lock().unwrap_or_else(|e| e.into_inner()).0.len(),
+            "idle host lists let go (VICTORY_LIST_POOL_IDLE_S)"
+        );
+    }
+    #[cfg(not(feature = "diagnostics"))]
+    let _ = count;
 }
 
 /// A wait for a memory value recorded into list `this`, with waits cut

@@ -453,6 +453,7 @@ fn sweep() {
     crate::shadow::let_go_idle();
     crate::texture::let_go_idle();
     crate::resource::let_go_idle();
+    crate::list::trim_idle();
 }
 
 /// The number of the newest submission begun, and of the newest of which all
